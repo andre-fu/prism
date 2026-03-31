@@ -45,19 +45,55 @@ class TenantUsage:
 class TenantManager:
     """Manages tenants, authentication, rate limiting, and usage tracking."""
 
-    def __init__(self):
+    def __init__(self, db_path: str = "prism.db"):
         self._tenants: dict[str, TenantConfig] = {}
         self._usage: dict[str, TenantUsage] = {}
         self._api_keys: dict[str, str] = {}  # key_hash -> tenant_id
         self._lock = threading.Lock()
 
-        # Create default tenant (no auth required)
-        self.register_tenant(TenantConfig(
-            tenant_id="default",
-            name="Default Tenant",
-            rate_limit_rps=100,
-            max_concurrent=64,
-        ))
+        # Persistent storage
+        from .persistence import PersistenceStore
+        self._db = PersistenceStore(db_path)
+
+        # Load existing tenants from database
+        self._load_from_db()
+
+        # Ensure default tenant exists
+        if "default" not in self._tenants:
+            self.register_tenant(TenantConfig(
+                tenant_id="default",
+                name="Default Tenant",
+                rate_limit_rps=100,
+                max_concurrent=64,
+            ))
+
+    def _load_from_db(self):
+        """Restore tenant state from persistent storage."""
+        for t in self._db.load_all_tenants():
+            config = TenantConfig(
+                tenant_id=t['tenant_id'], name=t['name'],
+                api_key_hash=t['api_key_hash'],
+                rate_limit_rps=t['rate_limit_rps'],
+                max_concurrent=t['max_concurrent'],
+                allowed_models=t['allowed_models'],
+                priority=t['priority'],
+                slo_ttft_ms=t['slo_ttft_ms'],
+                max_tokens_per_request=t['max_tokens_per_request'],
+                monthly_token_limit=t['monthly_token_limit'],
+            )
+            self._tenants[config.tenant_id] = config
+            # Restore usage from DB
+            usage_row = self._db.load_usage(config.tenant_id)
+            usage = TenantUsage()
+            if usage_row:
+                usage.total_requests = usage_row['total_requests']
+                usage.total_prompt_tokens = usage_row['total_prompt_tokens']
+                usage.total_completion_tokens = usage_row['total_completion_tokens']
+                usage.total_errors = usage_row['total_errors']
+            self._usage[config.tenant_id] = usage
+            # Restore API key mapping
+            if config.api_key_hash:
+                self._api_keys[config.api_key_hash] = config.tenant_id
 
     def register_tenant(self, config: TenantConfig) -> str:
         """Register a tenant. Returns the API key (only shown once)."""
@@ -65,14 +101,26 @@ class TenantManager:
             self._tenants[config.tenant_id] = config
             self._usage[config.tenant_id] = TenantUsage()
 
-            # Generate API key if not default tenant
+            api_key = ""
             if config.tenant_id != "default":
                 api_key = f"sk-{config.tenant_id}-{secrets.token_hex(16)}"
                 key_hash = hashlib.sha256(api_key.encode()).hexdigest()
                 config.api_key_hash = key_hash
                 self._api_keys[key_hash] = config.tenant_id
-                return api_key
-            return ""
+
+            # Persist to database
+            self._db.save_tenant(
+                config.tenant_id, name=config.name,
+                api_key_hash=config.api_key_hash,
+                rate_limit_rps=config.rate_limit_rps,
+                max_concurrent=config.max_concurrent,
+                allowed_models=config.allowed_models,
+                priority=config.priority,
+                slo_ttft_ms=config.slo_ttft_ms,
+                max_tokens_per_request=config.max_tokens_per_request,
+                monthly_token_limit=config.monthly_token_limit,
+            )
+            return api_key
 
     def authenticate(self, api_key: str | None) -> str:
         """Authenticate an API key. Returns tenant_id or 'default'."""
@@ -139,6 +187,8 @@ class TenantManager:
                 usage.total_completion_tokens += completion_tokens
                 if error:
                     usage.total_errors += 1
+                # Persist usage (batched — every complete updates DB)
+                self._db.update_usage(tenant_id, 0, completion_tokens, error)
 
     def get_tenant_config(self, tenant_id: str) -> TenantConfig | None:
         return self._tenants.get(tenant_id)
