@@ -55,9 +55,13 @@ class StaticWeightPool:
         self.qkv_b = [torch.zeros(qkv_size, dtype=dtype, device=device) for _ in range(nl)]
 
         self.o_w = [torch.zeros(hs, q_size, dtype=dtype, device=device) for _ in range(nl)]
-        # O bias: may or may not exist, allocate anyway (small)
         self.o_b = [torch.zeros(hs, dtype=dtype, device=device) for _ in range(nl)]
         self.has_o_bias = False
+
+        # QK Norm (Qwen3+): RMSNorm applied to Q and K before rotary + attention
+        self.q_norm_w = [torch.zeros(hd, dtype=dtype, device=device) for _ in range(nl)]
+        self.k_norm_w = [torch.zeros(hd, dtype=dtype, device=device) for _ in range(nl)]
+        self.has_qk_norm = False
 
         self.gu_w = [torch.zeros(2 * mlps, hs, dtype=dtype, device=device) for _ in range(nl)]
 
@@ -116,6 +120,13 @@ class StaticWeightPool:
                 self.o_b[i].copy_(o_bias.data)
                 self.has_o_bias = True
 
+            # QK Norm (Qwen3+)
+            q_norm = getattr(l.self_attn, 'q_norm', None)
+            if q_norm is not None and hasattr(q_norm, 'weight'):
+                self.q_norm_w[i].copy_(q_norm.weight.data)
+                self.k_norm_w[i].copy_(l.self_attn.k_norm.weight.data)
+                self.has_qk_norm = True
+
             # Stack gate+up
             g_w = l.mlp.gate_proj.weight.data
             gs = g_w.shape[0]
@@ -171,6 +182,13 @@ class StaticWeightPool:
                     pinned_weights[f"{prefix}.self_attn.v_proj.bias"].to(self.dtype))
 
             self.o_w[i].copy_(pinned_weights[f"{prefix}.self_attn.o_proj.weight"].to(self.dtype))
+
+            # QK Norm (Qwen3+)
+            q_norm_key = f"{prefix}.self_attn.q_norm.weight"
+            if q_norm_key in pinned_weights:
+                self.q_norm_w[i].copy_(pinned_weights[q_norm_key].to(self.dtype))
+                self.k_norm_w[i].copy_(pinned_weights[f"{prefix}.self_attn.k_norm.weight"].to(self.dtype))
+                self.has_qk_norm = True
 
             # Gate+up stacked
             g_w = pinned_weights[f"{prefix}.mlp.gate_proj.weight"].to(self.dtype)

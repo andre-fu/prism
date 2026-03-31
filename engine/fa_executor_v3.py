@@ -110,6 +110,10 @@ class FlashAttnExecutorV3:
             q = qkv[:, :, :qs].view(1, seq_len, nh, hd)
             k = qkv[:, :, qs:qs+kvs].view(1, seq_len, nkv, hd)
             v = qkv[:, :, qs+kvs:].view(1, seq_len, nkv, hd)
+            # QK Norm (Qwen3+): RMSNorm per-head before rotary
+            if w.has_qk_norm:
+                q = fused_rms_norm(q, w.q_norm_w[i], self.rms_eps)
+                k = fused_rms_norm(k, w.k_norm_w[i], self.rms_eps)
             q = (q * cos) + (_rotate_half(q) * sin)
             k = (k * cos) + (_rotate_half(k) * sin)
             attn = flash_attn_with_kvcache(q, kv.k_caches[i], kv.v_caches[i], k=k, v=v,
@@ -139,6 +143,9 @@ class FlashAttnExecutorV3:
             q = qkv[:, :, :qs].view(1, 1, nh, hd)
             k = qkv[:, :, qs:qs+kvs].view(1, 1, nkv, hd)
             v = qkv[:, :, qs+kvs:].view(1, 1, nkv, hd)
+            if w.has_qk_norm:
+                q = fused_rms_norm(q, w.q_norm_w[i], self.rms_eps)
+                k = fused_rms_norm(k, w.k_norm_w[i], self.rms_eps)
             q = (q * cu) + (_rotate_half(q) * su)
             k = (k * cu) + (_rotate_half(k) * su)
             attn = flash_attn_with_kvcache(q, self.kv.k_caches[i], self.kv.v_caches[i], k=k, v=v,
@@ -245,6 +252,9 @@ class FlashAttnExecutorV3:
             q = qkv[:, :, :qs].view(bs, 1, nh, hd)
             k = qkv[:, :, qs:qs+kvs].view(bs, 1, nkv, hd)
             v = qkv[:, :, qs+kvs:].view(bs, 1, nkv, hd)
+            if w.has_qk_norm:
+                q = fused_rms_norm(q, w.q_norm_w[i], self.rms_eps)
+                k = fused_rms_norm(k, w.k_norm_w[i], self.rms_eps)
             q = (q * cu) + (_rotate_half(q) * su)
             k = (k * cu) + (_rotate_half(k) * su)
             attn = flash_attn_with_kvcache(q, self.kv.k_caches[i], self.kv.v_caches[i], k=k, v=v,
@@ -367,6 +377,9 @@ class FlashAttnExecutorV3:
             q = qkv[:, :, :qs].view(actual_bs, 1, nh, hd)
             k = qkv[:, :, qs:qs+kvs].view(actual_bs, 1, nkv, hd)
             v = qkv[:, :, qs+kvs:].view(actual_bs, 1, nkv, hd)
+            if w.has_qk_norm:
+                q = fused_rms_norm(q, w.q_norm_w[i], self.rms_eps)
+                k = fused_rms_norm(k, w.k_norm_w[i], self.rms_eps)
             q = (q * cos) + (_rotate_half(q) * sin)
             k = (k * cos) + (_rotate_half(k) * sin)
             attn = flash_attn_with_kvcache(q, kv.k_caches[i], kv.v_caches[i], k=k, v=v,
