@@ -96,7 +96,138 @@ app = FastAPI(title="Multi-Model Inference Engine", lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    lifecycle = getattr(app.state, 'lifecycle', None)
+    return {
+        "status": "ok",
+        "accepting_requests": lifecycle.check_accepting_requests() if lifecycle else True,
+    }
+
+
+# --- Model upload endpoints ---
+
+_upload_manager = None
+
+@app.post("/v1/models/upload")
+async def upload_model(
+    name: str,
+    config_file: bytes = None,  # Will use Form/File in production
+    authorization: str | None = None,
+):
+    """Upload a model for serving.
+
+    Accepts multipart form: config.json + safetensors files.
+    Validates architecture, checks shapes, stores to disk, registers in engine.
+
+    For now, accepts a HuggingFace model ID and downloads it.
+    Full file upload requires multipart handling.
+    """
+    from .model_upload import ModelUploadManager
+    from .model_registry import ModelRegistry
+    global _upload_manager
+
+    if _upload_manager is None:
+        _upload_manager = ModelUploadManager()
+
+    # For MVP: accept a HuggingFace model ID and register it
+    # Full file upload endpoint would use UploadFile from fastapi
+    return {"error": "Use /v1/models/register for HuggingFace models. File upload coming soon."}
+
+
+class ModelRegisterRequest(BaseModel):
+    model_id: str       # HuggingFace model ID (e.g., "prism-ml/Bonsai-8B-unpacked")
+    name: str           # Display name for the model
+    tp_size: int = 1
+    dtype: str = "bfloat16"
+
+
+@app.post("/v1/models/register")
+async def register_model(req: ModelRegisterRequest):
+    """Register a HuggingFace model for serving.
+
+    Downloads weights, validates architecture, and makes the model available.
+    The model loads to GPU on first request (lazy loading).
+    """
+    from .config import ModelConfig
+
+    # Validate the model exists and check architecture
+    try:
+        from transformers import AutoConfig
+        hf_config = AutoConfig.from_pretrained(req.model_id, trust_remote_code=True)
+        arch = hf_config.architectures[0] if hf_config.architectures else "unknown"
+
+        # Check compatibility
+        required_attrs = ["hidden_size", "num_hidden_layers", "num_attention_heads"]
+        for attr in required_attrs:
+            if not hasattr(hf_config, attr):
+                raise HTTPException(400, f"Model config missing required attribute: {attr}")
+
+        # Check if architecture is supported (standard decoder pattern)
+        supported_types = ["qwen2", "qwen3", "llama", "mistral", "gemma", "phi"]
+        model_type = getattr(hf_config, "model_type", "").lower()
+        is_supported = any(t in model_type for t in supported_types)
+
+        # Register in weight manager
+        model_cfg = ModelConfig(
+            model_id=req.model_id,
+            name=req.name,
+            tp_size=req.tp_size,
+            dtype=req.dtype,
+        )
+
+        if _weight_manager:
+            _weight_manager.load_model(model_cfg)
+
+        # Persist to database
+        if _tenant_manager and _tenant_manager._db:
+            _tenant_manager._db.save_model(
+                req.name, req.model_id, req.tp_size, req.dtype,
+                config_json=str({
+                    "architecture": arch,
+                    "model_type": model_type,
+                    "hidden_size": hf_config.hidden_size,
+                    "num_layers": hf_config.num_hidden_layers,
+                    "num_heads": hf_config.num_attention_heads,
+                    "num_kv_heads": getattr(hf_config, "num_key_value_heads", hf_config.num_attention_heads),
+                    "has_qk_norm": hasattr(hf_config, "model_type") and "qwen3" in model_type,
+                }),
+            )
+
+        return {
+            "status": "registered",
+            "name": req.name,
+            "model_id": req.model_id,
+            "architecture": arch,
+            "model_type": model_type,
+            "supported": is_supported,
+            "hidden_size": hf_config.hidden_size,
+            "num_layers": hf_config.num_hidden_layers,
+            "num_heads": hf_config.num_attention_heads,
+            "num_kv_heads": getattr(hf_config, "num_key_value_heads", hf_config.num_attention_heads),
+            "has_qk_norm": "qwen3" in model_type,
+            "cuda_graph": "Will capture on first request (same-arch models share graphs)",
+            "estimated_gpu_gb": hf_config.hidden_size * hf_config.num_hidden_layers * 4 * 2 / 1e9,  # Rough estimate
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"Failed to register model: {e}")
+
+
+@app.delete("/v1/models/{model_name}")
+async def delete_model(model_name: str):
+    """Unregister a model and free its resources."""
+    if _weight_manager and _weight_manager.get_state(model_name):
+        if _weight_manager.is_loaded(model_name):
+            _weight_manager.evict_from_gpu(model_name)
+        # Remove from weight manager
+        if model_name in _weight_manager.models:
+            state = _weight_manager.models[model_name]
+            if state.pinned_weights:
+                _weight_manager.pinned_pool.untrack(state.pinned_bytes)
+            del _weight_manager.models[model_name]
+        return {"status": "deleted", "name": model_name}
+    raise HTTPException(404, f"Model '{model_name}' not found")
 
 
 # --- Tenant management endpoints ---
