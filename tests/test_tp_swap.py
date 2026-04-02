@@ -11,10 +11,10 @@ from safetensors.torch import load_file
 from transformers import AutoConfig, AutoTokenizer
 from huggingface_hub import snapshot_download
 
-from .distributed import TPGroup, shard_all_weights
-from .kv_cache import PagedKVPool
-from .tp_executor import TPModelExecutor
-from .test_tp import create_model_on_device
+from engine.distributed import TPGroup, shard_all_weights
+from engine.kv_cache import PagedKVPool
+from engine.tp_executor import TPModelExecutor
+from tests.test_tp import create_model_on_device
 
 TP_SIZE = 4
 GPU_IDS = [0, 1, 2, 3]

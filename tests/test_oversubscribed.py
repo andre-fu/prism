@@ -8,12 +8,12 @@ Sends interleaved requests to both models to stress the swap path.
 import time
 import torch
 
-from .config import ModelConfig, EngineConfig, SchedulerConfig
-from .memory_pool import PinnedPool, MultiGPUPool
-from .weight_manager import WeightManager
-from .request_manager import RequestManager, RequestState
-from .prefetch import PrefetchController
-from .scheduler import Scheduler
+from engine.config import ModelConfig, EngineConfig, SchedulerConfig
+from engine.memory_pool import PinnedPool, MultiGPUPool
+from engine.weight_manager import WeightManager
+from engine.request_manager import RequestManager, RequestState
+from engine.prefetch import PrefetchController
+from engine.scheduler import Scheduler
 
 GPU = 0
 

@@ -18,7 +18,7 @@ from .config import ModelConfig, EngineConfig, SchedulerConfig
 from .memory_pool import PinnedPool, MultiGPUPool
 from .weight_manager import WeightManager
 from .request_manager import RequestManager, RequestState
-from .scheduler_v2 import SchedulerV2
+from .scheduler import Scheduler
 
 
 # --- Request/Response models ---
@@ -44,7 +44,7 @@ class CompletionRequest(BaseModel):
 
 # --- Globals (initialized in lifespan) ---
 
-_scheduler: SchedulerV2 | None = None
+_scheduler: Scheduler | None = None
 _weight_manager: WeightManager | None = None
 _request_manager: RequestManager | None = None
 _engine_config: EngineConfig | None = None
@@ -76,9 +76,9 @@ def create_engine(models: list[dict], gpu_ids: list[int] = [0], **kwargs):
     for mc in model_configs:
         _weight_manager.load_model(mc)
 
-    # SchedulerV2 creates StaticWeightPool + FlashAttnExecutorV3 + CUDA graphs
+    # Scheduler creates StaticWeightPool + FlashAttnExecutorV3 + CUDA graphs
     # per architecture, assigns to GPUs, handles spatial multiplexing
-    _scheduler = SchedulerV2(_engine_config, sched_cfg, _weight_manager, _request_manager, gpu_pool)
+    _scheduler = Scheduler(_engine_config, sched_cfg, _weight_manager, _request_manager, gpu_pool)
 
     return _scheduler
 
@@ -88,7 +88,7 @@ async def lifespan(app: FastAPI):
     """Start scheduler on startup, stop on shutdown."""
     if _scheduler:
         _scheduler.run_background()
-        print("[Server] SchedulerV2 started (CUDA graphs + static weight pools)")
+        print("[Server] Scheduler started (CUDA graphs + static weight pools)")
     yield
     if _scheduler:
         _scheduler.cleanup()

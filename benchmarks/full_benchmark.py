@@ -8,17 +8,17 @@ import torch
 import gc
 import sys
 
-from ..config import ModelConfig, EngineConfig, SchedulerConfig
-from ..memory_pool import PinnedPool, MultiGPUPool
-from ..weight_manager import WeightManager
-from ..kv_cache import PagedKVPool
-from ..model_executor import ModelExecutor
-from ..request_manager import RequestManager, RequestState
-from ..prefetch import PrefetchController
-from ..scheduler import Scheduler
-from ..distributed import TPGroup, shard_all_weights
-from ..tp_executor import TPModelExecutor
-from ..test_tp import create_model_on_device
+from engineconfig import ModelConfig, EngineConfig, SchedulerConfig
+from enginememory_pool import PinnedPool, MultiGPUPool
+from engineweight_manager import WeightManager
+from enginekv_cache import PagedKVPool
+from enginemodel_executor import ModelExecutor
+from enginerequest_manager import RequestManager, RequestState
+from engineprefetch import PrefetchController
+from enginescheduler import Scheduler
+from enginedistributed import TPGroup, shard_all_weights
+from enginetp_executor import TPModelExecutor
+from enginetest_tp import create_model_on_device
 
 GPU = 0
 ALL_GPUS = [0, 1, 2, 3]

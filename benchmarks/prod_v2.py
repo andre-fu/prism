@@ -1,14 +1,14 @@
-"""Production scenarios using SchedulerV2 (static weight pool)."""
+"""Production scenarios using Scheduler (static weight pool)."""
 
 import time
 import torch
 import threading
 
-from ..config import ModelConfig, EngineConfig, SchedulerConfig
-from ..memory_pool import PinnedPool, MultiGPUPool
-from ..weight_manager import WeightManager
-from ..request_manager import RequestManager, RequestState
-from ..scheduler_v2 import SchedulerV2
+from engineconfig import ModelConfig, EngineConfig, SchedulerConfig
+from enginememory_pool import PinnedPool, MultiGPUPool
+from engineweight_manager import WeightManager
+from enginerequest_manager import RequestManager, RequestState
+from enginescheduler import Scheduler
 
 GPU = 0
 
@@ -22,7 +22,7 @@ def setup(models_cfg, kv_budget=15):
     rm = RequestManager()
     for mc in models_cfg:
         wm.load_model(mc)
-    scheduler = SchedulerV2(engine_cfg, sched_cfg, wm, rm, gpu)
+    scheduler = Scheduler(engine_cfg, sched_cfg, wm, rm, gpu)
     return wm, rm, scheduler
 
 

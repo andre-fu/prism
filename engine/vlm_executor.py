@@ -18,7 +18,7 @@ import requests as http_requests
 import base64
 import io
 
-from .fa_kv_cache import FlashAttnKVCache
+from .kv_cache import FlashAttnKVCache
 from .weight_pool import StaticWeightPool
 from .fused_kernels import fused_rms_norm
 

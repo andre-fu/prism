@@ -1,404 +1,240 @@
-"""Multi-model scheduler: decides which model gets GPU time, manages swaps."""
+"""Scheduler v2: uses static weight pool for zero-allocation model swaps.
+
+Simplified architecture:
+  - One StaticWeightPool per architecture (pre-allocated at startup)
+  - One FlashAttnExecutorV3 per architecture (CUDA graph captured once)
+  - Model swap = copy_() from pinned RAM into static GPU buffers
+  - Async prefetch = copy on GPU copy stream while current model generates
+"""
 
 import time
 import threading
 import torch
 from dataclasses import dataclass, field
+from collections import deque
 
 from .config import EngineConfig, SchedulerConfig
 from .memory_pool import PinnedPool, MultiGPUPool
 from .weight_manager import WeightManager
-from .kv_cache import PagedKVPool
-from .fa_kv_cache import FlashAttnKVCache
-from .model_executor import ModelExecutor
-from .fa_executor_v2 import FlashAttnExecutorV2
-from .tp_executor import TPModelExecutor
-from .distributed import TPGroup
+from .kv_cache import FlashAttnKVCache
+from .weight_pool import StaticWeightPool
+from .executor import FlashAttnExecutorV3
 from .request_manager import RequestManager, Request, RequestState
-from .prefetch import PrefetchController
+
+
+def _arch_key(hf_config):
+    return (hf_config.num_hidden_layers, hf_config.hidden_size,
+            hf_config.num_attention_heads, hf_config.num_key_value_heads,
+            hf_config.intermediate_size)
 
 
 class Scheduler:
-    """Main scheduling loop.
+    """Production scheduler with static weight pools."""
 
-    Round-robins across models with pending requests. For each model:
-    1. Ensure weights are on GPU (via prefetch or sync load)
-    2. Pop pending requests, run prefill
-    3. Run decode steps for active requests
-    4. Signal prefetch for the next likely model
-    5. Yield after max_consecutive_batches
-    """
-
-    def __init__(
-        self,
-        engine_config: EngineConfig,
-        scheduler_config: SchedulerConfig,
-        weight_manager: WeightManager,
-        request_manager: RequestManager,
-        prefetch_controller: PrefetchController,
-        gpu_pool: MultiGPUPool,
-    ):
+    def __init__(self, engine_config: EngineConfig, scheduler_config: SchedulerConfig,
+                 weight_manager: WeightManager, request_manager: RequestManager,
+                 gpu_pool: MultiGPUPool):
         self.engine_config = engine_config
         self.scheduler_config = scheduler_config
         self.wm = weight_manager
         self.rm = request_manager
-        self.prefetch = prefetch_controller
         self.gpu_pool = gpu_pool
 
-        # Per-model KV caches (FlashAttnKVCache for TP=1, PagedKVPool list for TP>1)
-        self._kv_pools: dict[str, PagedKVPool] = {}  # Legacy FlashInfer (TP>1)
-        self._fa_kv: dict[str, FlashAttnKVCache] = {}  # flash_attn (TP=1)
-        self._tp_kv_pools: dict[str, list[PagedKVPool]] = {}
+        self.default_gpu = engine_config.gpu_ids[0]
 
-        # Per-model executors
-        self._executors: dict[str, FlashAttnExecutorV2 | TPModelExecutor] = {}
+        # Per-architecture: weight pool + executor + KV cache + GPU assignment
+        self._pools: dict[tuple, StaticWeightPool] = {}
+        self._executors: dict[tuple, FlashAttnExecutorV3] = {}
+        self._kv_caches: dict[tuple, FlashAttnKVCache] = {}
+        self._arch_gpu: dict[tuple, int] = {}
 
-        # Architecture-keyed executor cache: models with same arch share graph
-        # Key: (num_layers, hidden_size, num_heads, num_kv_heads, intermediate_size)
-        self._arch_executors: dict[tuple, FlashAttnExecutorV2] = {}
+        # Current state — per-architecture tracking for spatial multiplexing
+        self._current_model: str | None = None  # Legacy, for single-arch compat
+        self._current_arch: tuple | None = None
+        self._current_model_for_arch: dict[tuple, str] = {}
 
-        # Tracking
-        self._current_model: str | None = None
+        # Async prefetch state
+        self._prefetch_model: str | None = None
+        self._prefetch_event: torch.cuda.Event | None = None
+
+        # Prefix cache per architecture
+        from .prefix_cache import PrefixCache
+        self._PrefixCache = PrefixCache
+        self._prefix_caches: dict[tuple, PrefixCache] = {}
+
+        # Control
         self._running = False
         self._thread: threading.Thread | None = None
-        # Stats
         self.stats = SchedulerStats()
 
-    def _make_kv_pool(self, model_name: str, device: str, tp_kv_heads: int | None = None) -> PagedKVPool:
-        """Create a KV pool for a model on a specific device."""
+        # Initialize pools for all architectures
+        self._init_pools()
+
+    def _init_pools(self):
+        """Allocate weight pools across GPUs. Each architecture gets its own GPU."""
+        seen_archs = {}
+        gpu_idx = 0
+        for mc in self.engine_config.models:
+            state = self.wm.get_state(mc.name)
+            if state is None:
+                continue
+            key = _arch_key(state.hf_config)
+            if key in seen_archs:
+                continue
+            seen_archs[key] = state.hf_config
+
+            # Assign a GPU to this architecture (round-robin across available GPUs)
+            gpu_id = self.engine_config.gpu_ids[gpu_idx % len(self.engine_config.gpu_ids)]
+            device = f"cuda:{gpu_id}"
+            gpu_idx += 1
+
+            # Weight pool on this GPU
+            pool = StaticWeightPool(state.hf_config, device, torch.bfloat16)
+            self._pools[key] = pool
+
+            # KV cache on same GPU
+            nkv = state.hf_config.num_key_value_heads
+            hd = state.hf_config.hidden_size // state.hf_config.num_attention_heads
+            nl = state.hf_config.num_hidden_layers
+            page_size = 256
+            free_gb = torch.cuda.mem_get_info(gpu_id)[0] / 1e9
+            kv_budget = min(self.engine_config.kv_cache_budget_gb, free_gb * 0.7)
+            bytes_per_page = 2 * page_size * nkv * hd * 2 * nl
+            max_pages = max(int(kv_budget * 1e9 / bytes_per_page), 16)
+            kv = FlashAttnKVCache(nl, nkv, hd, max_pages, page_size, device, torch.bfloat16)
+            self._kv_caches[key] = kv
+
+            # Executor on same GPU
+            executor = FlashAttnExecutorV3(pool, kv, device)
+            self._executors[key] = executor
+
+            # Prefix cache for this architecture
+            self._prefix_caches[key] = self._PrefixCache(kv, page_size=page_size)
+
+            # Track which GPU each arch is on
+            self._arch_gpu[key] = gpu_id
+
+            print(f"[Scheduler] Arch {key[:2]} on GPU {gpu_id}: {pool.total_gb:.1f}GB weights, "
+                  f"{max_pages} KV pages ({max_pages * page_size} tokens), "
+                  f"{free_gb - pool.total_gb:.1f}GB free")
+
+    def _get_arch(self, model_name: str) -> tuple:
         state = self.wm.get_state(model_name)
-        hf_config = state.hf_config
-        dtype = getattr(torch, state.config.dtype)
+        return _arch_key(state.hf_config)
 
-        num_kv_heads = tp_kv_heads or hf_config.num_key_value_heads
-        head_dim = hf_config.hidden_size // hf_config.num_attention_heads
-        page_size = self.engine_config.kv_page_size
+    def _swap_to_model(self, model_name: str):
+        """Swap weights to a model. If async prefetch completed, this is instant."""
+        if self._current_model == model_name:
+            return
 
-        num_models = max(len(self.engine_config.models), 1)
-        kv_budget = self.engine_config.kv_cache_budget_gb / num_models
-
-        bytes_per_page = (
-            2 * page_size * num_kv_heads * head_dim
-            * dtype.itemsize * hf_config.num_hidden_layers
-        )
-        max_pages = max(int(kv_budget * 1e9 / bytes_per_page), 64)
-
-        return PagedKVPool(
-            num_layers=hf_config.num_hidden_layers,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            max_pages=max_pages,
-            page_size=page_size,
-            device=device,
-            dtype=dtype,
-        )
-
-    def _get_kv_pool(self, model_name: str, gpu_id: int) -> PagedKVPool:
-        """Get or create a KV pool for a TP=1 model."""
-        if model_name in self._kv_pools:
-            return self._kv_pools[model_name]
-        pool = self._make_kv_pool(model_name, f"cuda:{gpu_id}")
-        self._kv_pools[model_name] = pool
-        return pool
-
-    def _get_tp_kv_pools(self, model_name: str, gpu_ids: list[int]) -> list[PagedKVPool]:
-        """Get or create KV pools for a TP>1 model (one per GPU)."""
-        if model_name in self._tp_kv_pools:
-            return self._tp_kv_pools[model_name]
+        arch = self._get_arch(model_name)
+        pool = self._pools[arch]
         state = self.wm.get_state(model_name)
-        tp_size = len(gpu_ids)
-        kv_heads_per_gpu = state.hf_config.num_key_value_heads // tp_size
-        pools = [self._make_kv_pool(model_name, f"cuda:{g}", kv_heads_per_gpu) for g in gpu_ids]
-        self._tp_kv_pools[model_name] = pools
-        return pools
 
-    def _get_arch_key(self, hf_config) -> tuple:
-        """Architecture fingerprint — models with same key share CUDA graphs."""
-        return (
-            hf_config.num_hidden_layers,
-            hf_config.hidden_size,
-            hf_config.num_attention_heads,
-            hf_config.num_key_value_heads,
-            hf_config.intermediate_size,
-        )
-
-    def _get_fa_kv(self, model_name: str, gpu_id: int) -> FlashAttnKVCache:
-        """Get or create flash_attn KV cache.
-
-        Models with the same architecture SHARE one KV cache (and one executor).
-        KV sequences are cleared on model switch.
-        """
-        state = self.wm.get_state(model_name)
-        arch_key = self._get_arch_key(state.hf_config)
-
-        # Share KV cache across same-architecture models
-        if model_name in self._fa_kv:
-            return self._fa_kv[model_name]
-
-        # Check if another model with same arch already has a cache
-        for other_name, cache in self._fa_kv.items():
-            other_state = self.wm.get_state(other_name)
-            if other_state and self._get_arch_key(other_state.hf_config) == arch_key:
-                self._fa_kv[model_name] = cache  # Share the same cache object
-                return cache
-
-        hf_config = state.hf_config
-        dtype = getattr(torch, state.config.dtype)
-        num_kv_heads = hf_config.num_key_value_heads
-        head_dim = hf_config.hidden_size // hf_config.num_attention_heads
-        page_size = 256
-
-        kv_budget = self.engine_config.kv_cache_budget_gb
-        bytes_per_page = (
-            2 * page_size * num_kv_heads * head_dim * dtype.itemsize * hf_config.num_hidden_layers
-        )
-        max_pages = max(int(kv_budget * 1e9 / bytes_per_page), 16)
-
-        cache = FlashAttnKVCache(
-            hf_config.num_hidden_layers, num_kv_heads, head_dim,
-            max_pages, page_size, f"cuda:{gpu_id}", dtype,
-        )
-        self._fa_kv[model_name] = cache
-        return cache
-
-    def _create_executor(self, model_name: str, gpu_id: int) -> FlashAttnExecutorV2 | TPModelExecutor:
-        """Create the right executor for a model's TP size.
-
-        For TP=1: uses FlashAttnExecutorV2 with CUDA graphs.
-        If another model with the same architecture already has an executor,
-        reuse it (swap weights into static buffers, no graph recapture).
-        """
-        state = self.wm.get_state(model_name)
-        tp_size = state.config.tp_size
-
-        if tp_size > 1:
-            models = self.wm.get_models(model_name)
-            gpu_ids = state.active_gpu_ids
-            kv_pools = self._get_tp_kv_pools(model_name, gpu_ids)
-            tp_group = TPGroup(gpu_ids)
-            return TPModelExecutor(models, kv_pools, tp_group)
-
-        # TP=1: use flash_attn with CUDA graphs
-        model = self.wm.get_model(model_name)
-        kv_cache = self._get_fa_kv(model_name, gpu_id)
-        arch_key = self._get_arch_key(state.hf_config)
-
-        # Check if we have an executor for this architecture (reuse graph + buffers)
-        if arch_key in self._arch_executors:
-            executor = self._arch_executors[arch_key]
-            executor.kv = kv_cache
-            executor.swap_weights(model)
-            return executor
-
-        # New architecture — free old executors to reclaim GPU memory
-        for old_key, old_exec in list(self._arch_executors.items()):
-            old_exec.invalidate_graph()
-        self._arch_executors.clear()
-        import gc; gc.collect()
-        for gid in self.engine_config.gpu_ids:
-            with torch.cuda.device(gid):
-                torch.cuda.empty_cache()
-
-        executor = FlashAttnExecutorV2(model, kv_cache, f"cuda:{gpu_id}")
-        self._arch_executors[arch_key] = executor
-        return executor
-
-    def _ensure_model_loaded(self, model_name: str, gpu_id: int) -> ModelExecutor | TPModelExecutor:
-        """Ensure model weights are on GPU and return an executor."""
-        state = self.wm.get_state(model_name)
-        tp_size = state.config.tp_size
-
-        # Path 1: already loaded
-        if self.wm.is_loaded(model_name):
-            if model_name not in self._executors:
-                self._executors[model_name] = self._create_executor(model_name, gpu_id)
-            return self._executors[model_name]
-
-        # Path 2: prefetch completed
-        if self.prefetch.is_ready(model_name):
-            self.prefetch.complete_prefetch(model_name)
+        # Check if async prefetch already loaded this model
+        if self._prefetch_model == model_name and self._prefetch_event is not None:
+            self._prefetch_event.synchronize()
+            self._prefetch_model = None
+            self._prefetch_event = None
             self.stats.prefetch_hits += 1
-            self._executors[model_name] = self._create_executor(model_name, gpu_id)
-            return self._executors[model_name]
-
-        # Path 3: prefetch in-flight
-        if self.prefetch.is_in_flight(model_name):
-            self.prefetch.wait_ready(model_name)
-            self.prefetch.complete_prefetch(model_name)
-            self.stats.prefetch_hits += 1
-            self._executors[model_name] = self._create_executor(model_name, gpu_id)
-            return self._executors[model_name]
-
-        # Path 4: cold load
-        # For TP>1, need space on ALL GPUs in the TP group
-        if tp_size > 1:
-            gpu_ids = self.engine_config.gpu_ids[:tp_size]
-            for gid in gpu_ids:
-                pool = self.gpu_pool[gid]
-                while not pool.can_fit_weights(state.gpu_bytes_per_device):
-                    victim = self.wm.lru_candidate(gid)
-                    if victim is None:
-                        raise RuntimeError(f"Cannot fit {model_name} on GPU {gid}")
-                    self._evict_model(victim)
-                    self.stats.evictions += 1
-            self.wm.load_to_gpu_tp(model_name, gpu_ids)
         else:
-            pool = self.gpu_pool[gpu_id]
-            while not pool.can_fit_weights(state.gpu_bytes_per_device):
-                victim = self.wm.lru_candidate(gpu_id)
-                if victim is None:
-                    raise RuntimeError(f"Cannot fit {model_name} on GPU {gpu_id}")
-                self._evict_model(victim)
-                self.stats.evictions += 1
-            self.wm.load_to_gpu(model_name, gpu_id)
+            # Sync swap: copy from pinned RAM to GPU buffers
+            t0 = time.perf_counter()
+            pool.load_from_pinned(state.pinned_weights, state.hf_config)
+            torch.cuda.synchronize()
+            t_swap = time.perf_counter() - t0
+            self.stats.sync_swaps += 1
+            self.stats.swap_time_ms += t_swap * 1000
 
-        self.stats.sync_loads += 1
-        self._executors[model_name] = self._create_executor(model_name, gpu_id)
-        return self._executors[model_name]
+        # If switching architectures, invalidate graph
+        if arch != self._current_arch:
+            self._executors[arch].invalidate_graph()
+            self._current_arch = arch
 
-    def _start_prefetch_for_next(self, current_model: str, gpu_id: int):
-        """Start async prefetch for the next likely model.
+        self._current_model = model_name
 
-        Only runs if current model is already loaded (we need it to be serving
-        while the prefetch transfers on the copy stream). Does NOT reserve budget —
-        that happens in complete_prefetch when the model is activated.
-        """
-        # Don't prefetch if current model isn't even loaded yet
-        if not self.wm.is_loaded(current_model):
+    def _start_async_prefetch(self, model_name: str):
+        """Start async copy of model weights on GPU copy stream."""
+        if model_name == self._current_model:
+            return
+        if self._prefetch_model == model_name:
             return
 
-        next_model = self.prefetch.suggest_prefetch(current_model, gpu_id)
-        if next_model is None:
-            return
+        arch = self._get_arch(model_name)
+        pool = self._pools[arch]
+        state = self.wm.get_state(model_name)
+        gpu_id = self._arch_gpu[arch]
+        copy_stream = self.gpu_pool[gpu_id].copy_stream
 
-        state = self.wm.get_state(next_model)
-        if state is None:
-            return
+        with torch.cuda.stream(copy_stream):
+            pool.load_from_pinned(state.pinned_weights, state.hf_config)
+            event = copy_stream.record_event()
 
-        # Check if there's PHYSICAL space (ignore budget — we'll evict on switch)
-        # The async transfer just puts data on GPU; budget is tracked on activation
-        self.prefetch.start_prefetch(next_model, gpu_id)
+        self._prefetch_model = model_name
+        self._prefetch_event = event
         self.stats.prefetch_triggers += 1
 
-    def _evict_model(self, model_name: str):
-        """Evict a model: free KV cache, requeue active requests, remove from GPU."""
-        # Requeue any active requests — they'll need re-prefill
-        active = self.rm.get_active(model_name)
-        for req in active:
-            if req.state == RequestState.DECODING:
-                # Reset to queued state — scheduler will re-prefill when model reloads
-                req.state = RequestState.QUEUED
-                req.generated_tokens.clear()
-                req.first_token_time = 0.0
-                req.seq_id = -1
-                self.stats.requeued += 1
-        # Move active requests back to pending queue
-        with self.rm._lock:
-            requeued = self.rm._active.pop(model_name, [])
-            for req in requeued:
-                if req.state == RequestState.QUEUED:
-                    self.rm._queues.setdefault(model_name, __import__('collections').deque()).append(req)
-
-        # Free this model's KV sequences (not ALL sequences — other models' KV is preserved)
-        if model_name in self._fa_kv:
-            self._fa_kv[model_name].free_model_sequences(model_name)
-            # Don't delete the cache object — it's shared with other same-arch models
-        if model_name in self._kv_pools:
-            self._kv_pools[model_name].free_all()
-            del self._kv_pools[model_name]
-        if model_name in self._tp_kv_pools:
-            for pool in self._tp_kv_pools[model_name]:
-                pool.free_all()
-            del self._tp_kv_pools[model_name]
-        # Don't delete arch_executors — they're reused across models
-        if model_name in self._executors:
-            del self._executors[model_name]
-        self.wm.evict_from_gpu(model_name)
-        print(f"[Scheduler] Evicted {model_name} (requeued {len(active)} requests)")
-
     def _pick_next_model(self) -> str | None:
-        """Round-robin: pick next model with pending or active requests."""
         candidates = set()
         candidates.update(self.rm.models_with_pending())
         candidates.update(self.rm.models_with_active())
-
         if not candidates:
             return None
-
-        # Simple round-robin: sort and pick next after current
         ordered = sorted(candidates)
         if self._current_model is None or self._current_model not in ordered:
             return ordered[0]
-
         idx = ordered.index(self._current_model)
-        next_idx = (idx + 1) % len(ordered)
-        return ordered[next_idx]
+        return ordered[(idx + 1) % len(ordered)]
 
-    def _kv_new_sequence(self, model_name: str, seq_id: int):
-        """Create a new sequence in all KV pools for this model."""
-        if model_name in self._fa_kv:
-            self._fa_kv[model_name].new_sequence(seq_id, owner=model_name)
-        if model_name in self._kv_pools:
-            self._kv_pools[model_name].new_sequence(seq_id)
-        if model_name in self._tp_kv_pools:
-            for pool in self._tp_kv_pools[model_name]:
-                pool.new_sequence(seq_id)
-
-    def _kv_free_sequence(self, model_name: str, seq_id: int):
-        """Free a sequence from all KV pools for this model."""
-        if model_name in self._fa_kv:
-            self._fa_kv[model_name].free_sequence(seq_id)
-        if model_name in self._kv_pools:
-            self._kv_pools[model_name].free_sequence(seq_id)
-        if model_name in self._tp_kv_pools:
-            for pool in self._tp_kv_pools[model_name]:
-                pool.free_sequence(seq_id)
-
-    def _serve_model(self, model_name: str, gpu_id: int):
-        """Serve one batch cycle for a model: prefill new requests + decode active ones."""
-        try:
-            executor = self._ensure_model_loaded(model_name, gpu_id)
-        except Exception as e:
-            print(f"[Scheduler] Failed to load {model_name}: {e}")
-            # Fail all pending requests for this model
-            for req in self.rm.pop_pending(model_name, max_count=999):
-                req.error = str(e)
-                req.state = RequestState.DONE
-                req.done_time = time.time()
-                self.rm.complete_request(req.id)
-            return
-
+    def _serve_model(self, model_name: str):
+        """Serve one batch: prefill new requests + decode active ones."""
+        arch = self._get_arch(model_name)
+        executor = self._executors[arch]
+        kv = self._kv_caches[arch]
         state = self.wm.get_state(model_name)
-        device = f"cuda:{gpu_id}"
+        device = executor.device
 
-        # Pop new requests and prefill them
-        new_requests = self.rm.pop_pending(model_name, max_count=self.scheduler_config.max_batch_tokens)
-        for req in new_requests:
+        # Prefill new requests (with prefix cache check)
+        prefix_cache = self._prefix_caches.get(arch)
+        new_reqs = self.rm.pop_pending(model_name, max_count=8)
+        for req in new_reqs:
             try:
                 input_ids = torch.tensor([req.prompt_tokens], device=device)
-                self._kv_new_sequence(model_name, req.seq_id)
-                logits = executor.prefill(input_ids, req.seq_id)
+
+                # Check prefix cache
+                prefix_pages, prefix_len = [], 0
+                if prefix_cache:
+                    prefix_pages, prefix_len = prefix_cache.lookup(req.prompt_tokens, model_name)
+                    if prefix_pages:
+                        prefix_cache.ref_pages(prefix_pages)
+
+                kv.new_sequence(req.seq_id, owner=model_name,
+                               prefix_pages=prefix_pages if prefix_pages else None,
+                               prefix_len=prefix_len)
+                logits = executor.prefill(input_ids, req.seq_id, prefix_len=prefix_len)
+
+                # Store prefix for future requests
+                if prefix_cache and not prefix_pages:
+                    prefix_cache.store(req.prompt_tokens, kv.seq_pages.get(req.seq_id, []), model_name)
                 next_token = logits[:, -1, :].argmax(dim=-1).item()
                 req.generated_tokens.append(next_token)
                 req.first_token_time = time.time()
                 req.state = RequestState.DECODING
             except torch.cuda.OutOfMemoryError:
-                print(f"[Scheduler] OOM during prefill for request {req.id}, freeing KV cache")
-                self._kv_free_sequence(model_name, req.seq_id)
-                req.error = "GPU out of memory during prefill"
+                kv.free_sequence(req.seq_id)
+                req.error = "OOM during prefill"
                 req.state = RequestState.DONE
                 req.done_time = time.time()
                 self.rm.complete_request(req.id)
                 torch.cuda.empty_cache()
             except Exception as e:
-                print(f"[Scheduler] Prefill error for request {req.id}: {e}")
-                self._kv_free_sequence(model_name, req.seq_id)
+                kv.free_sequence(req.seq_id)
                 req.error = str(e)
                 req.state = RequestState.DONE
                 req.done_time = time.time()
                 self.rm.complete_request(req.id)
 
-        # Check stop conditions and collect active decoding requests
+        # Collect active decode requests for THIS model
         active = self.rm.get_active(model_name)
         eos = state.tokenizer.eos_token_id
         to_decode = []
@@ -407,177 +243,191 @@ class Scheduler:
                 continue
             last_token = req.generated_tokens[-1]
             if last_token == eos or len(req.generated_tokens) >= req.max_new_tokens:
-                self._kv_free_sequence(model_name, req.seq_id)
+                kv.free_sequence(req.seq_id)
                 self.rm.complete_request(req.id)
                 self.stats.completed += 1
                 continue
             to_decode.append(req)
 
-        # Batched decode: all active sequences in one forward pass
-        if to_decode:
-            try:
-                token_ids = [req.generated_tokens[-1] for req in to_decode]
-                seq_ids = [req.seq_id for req in to_decode]
+        if not to_decode:
+            return
 
-                if len(to_decode) == 1:
-                    token_input = torch.tensor([[token_ids[0]]], device=device)
-                    logits = executor.decode_step(token_input, seq_ids[0])
-                    logits = logits[:, -1, :]  # [1, vocab]
+        try:
+            token_ids = [r.generated_tokens[-1] for r in to_decode]
+            seq_ids = [r.seq_id for r in to_decode]
+
+            if len(to_decode) == 1:
+                token_input = torch.tensor([[token_ids[0]]], device=device)
+                logits = executor.decode_step(token_input, seq_ids[0])
+                logits = logits[:, -1, :]
+            else:
+                logits = executor.batched_decode_step(token_ids, seq_ids)
+
+            for i, req in enumerate(to_decode):
+                if req.temperature <= 0:
+                    next_token = logits[i].argmax(dim=-1).item()
                 else:
-                    logits = executor.batched_decode_step(token_ids, seq_ids)
+                    probs = torch.softmax(logits[i] / req.temperature, dim=-1)
+                    next_token = torch.multinomial(probs, 1).item()
+                req.generated_tokens.append(next_token)
+                self.stats.tokens_generated += 1
+        except Exception as e:
+            print(f"[Scheduler] Decode error: {e}")
+            for req in to_decode:
+                kv.free_sequence(req.seq_id)
+                req.error = str(e)
+                req.state = RequestState.DONE
+                req.done_time = time.time()
+                self.rm.complete_request(req.id)
 
-                for i, req in enumerate(to_decode):
-                    if req.temperature <= 0:
-                        next_token = logits[i].argmax(dim=-1).item()
-                    else:
-                        probs = torch.softmax(logits[i] / req.temperature, dim=-1)
-                        next_token = torch.multinomial(probs, 1).item()
-                    req.generated_tokens.append(next_token)
-                    self.stats.tokens_generated += 1
-            except torch.cuda.OutOfMemoryError:
-                print(f"[Scheduler] OOM during decode, freeing all KV for {model_name}")
-                for req in to_decode:
-                    self._kv_free_sequence(model_name, req.seq_id)
-                    req.error = "GPU out of memory during decode"
-                    req.state = RequestState.DONE
-                    req.done_time = time.time()
-                    self.rm.complete_request(req.id)
-                torch.cuda.empty_cache()
-            except Exception as e:
-                print(f"[Scheduler] Decode error: {e}")
-                for req in to_decode:
-                    self._kv_free_sequence(model_name, req.seq_id)
-                    req.error = str(e)
-                    req.state = RequestState.DONE
-                    req.done_time = time.time()
-                    self.rm.complete_request(req.id)
+    def _serve_gpu(self, arch_key: tuple):
+        """Serve one batch cycle for all models on a specific GPU/architecture."""
+        # Find the model with most urgent work for this architecture
+        # Priority: highest priority first, then earliest deadline, then most work
+        import time as _time
+        now = _time.time()
+        candidates = []
+        for mc in self.engine_config.models:
+            state = self.wm.get_state(mc.name)
+            if state and _arch_key(state.hf_config) == arch_key:
+                pending = self.rm.pending_count(mc.name)
+                active = self.rm.active_count(mc.name)
+                if pending > 0 or active > 0:
+                    # Find highest priority among pending requests
+                    max_priority = 0
+                    earliest_deadline = float('inf')
+                    with self.rm._lock:
+                        for req in self.rm._queues.get(mc.name, []):
+                            max_priority = max(max_priority, req.priority)
+                            if req.slo_ttft_ms:
+                                deadline = req.arrival_time + req.slo_ttft_ms / 1000
+                                earliest_deadline = min(earliest_deadline, deadline)
+                    candidates.append((max_priority, -earliest_deadline, pending + active, mc.name))
 
-    def step(self) -> bool:
-        """Run one scheduler step. Returns True if work was done."""
-        model_name = self._pick_next_model()
-        if model_name is None:
+        if not candidates:
             return False
 
-        gpu_id = self.engine_config.gpu_ids[0]  # Single GPU for now
-        prefetch_started = False
+        # Sort: highest priority, earliest deadline, most work
+        candidates.sort(reverse=True)
+        model_name = candidates[0][3]
 
-        # Continuous batching: serve this model, accepting new requests mid-generation
+        # Swap weights if needed (same arch = just copy_(), different model)
+        current = self._current_model_for_arch.get(arch_key)
+        if current != model_name:
+            self._swap_to_model(model_name)
+            self._current_model_for_arch[arch_key] = model_name
+
+        # Serve batches
         batches = 0
         while batches < self.scheduler_config.max_consecutive_batches:
-            # Check if there's any work for this model (pending OR active)
-            has_pending = self.rm.pending_count(model_name) > 0
-            has_active = self.rm.active_count(model_name) > 0
-            if not has_pending and not has_active:
+            has_work = (self.rm.pending_count(model_name) > 0 or
+                        self.rm.active_count(model_name) > 0)
+            if not has_work:
                 break
-
-            # _serve_model: prefills any new pending requests, then decodes all active
-            # This means new requests arriving between decode steps get picked up
-            # on the next _serve_model call — true continuous batching
-            self._serve_model(model_name, gpu_id)
+            self._serve_model(model_name)
             batches += 1
             self.stats.batches += 1
 
-            # After first batch: start async prefetch for next model
-            if not prefetch_started:
-                self._start_prefetch_for_next(model_name, gpu_id)
-                prefetch_started = True
-
-            # Yield to other models if they have pending requests
-            other_pending = [
-                n for n in self.rm.models_with_pending()
-                if n != model_name
+            # Yield if other models on same arch need attention
+            other_same_arch = [
+                mc.name for mc in self.engine_config.models
+                if mc.name != model_name
+                and self.wm.get_state(mc.name)
+                and _arch_key(self.wm.get_state(mc.name).hf_config) == arch_key
+                and self.rm.pending_count(mc.name) > 0
             ]
-            if other_pending and batches >= 2:
-                # Yield after at least 2 batches (prefill + some decode)
+            if other_same_arch and batches >= 2:
                 break
 
-        self._current_model = model_name
         return True
 
-    def run(self, timeout: float | None = None):
-        """Run the scheduler loop until stopped or timeout."""
-        self._running = True
-        self.prefetch.start()
-        start = time.time()
+    def step(self) -> bool:
+        """Serve all GPUs that have pending work — concurrent across architectures."""
+        # Collect architectures with pending work
+        active_archs = set()
+        for mc in self.engine_config.models:
+            state = self.wm.get_state(mc.name)
+            if state is None:
+                continue
+            key = _arch_key(state.hf_config)
+            if key in self._pools:
+                if self.rm.pending_count(mc.name) > 0 or self.rm.active_count(mc.name) > 0:
+                    active_archs.add(key)
 
+        if not active_archs:
+            return False
+
+        if len(active_archs) == 1:
+            # Single architecture — no threading overhead
+            return self._serve_gpu(next(iter(active_archs)))
+
+        # Multiple architectures on different GPUs — dispatch concurrently
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=len(active_archs)) as pool:
+            futures = {pool.submit(self._serve_gpu, key): key for key in active_archs}
+            did_work = False
+            for future in as_completed(futures):
+                try:
+                    if future.result():
+                        did_work = True
+                except Exception as e:
+                    print(f"[Scheduler] GPU dispatch error: {e}")
+            return did_work
+
+    def run(self, timeout: float | None = None):
+        self._running = True
+        start = time.time()
         try:
             while self._running:
                 if timeout and (time.time() - start) > timeout:
                     break
                 try:
-                    did_work = self.step()
-                    if not did_work:
+                    if not self.step():
                         time.sleep(0.001)
                 except Exception as e:
-                    print(f"[Scheduler] Step error (recovering): {e}")
-                    time.sleep(0.01)  # Brief pause before retry
+                    print(f"[Scheduler] Step error: {e}")
+                    time.sleep(0.01)
         finally:
-            self.prefetch.stop()
             self._running = False
 
     def run_background(self, timeout: float | None = None):
-        """Run the scheduler in a background thread."""
         self._thread = threading.Thread(target=self.run, kwargs={"timeout": timeout}, daemon=True)
         self._thread.start()
 
     def stop(self):
-        """Stop the scheduler."""
         self._running = False
         if self._thread:
             self._thread.join(timeout=5.0)
 
     def cleanup(self):
-        """Free all GPU resources — call before shutdown or benchmarks."""
         self.stop()
-
-        # Free CUDA graphs
-        for executor in self._arch_executors.values():
+        for executor in self._executors.values():
             executor.invalidate_graph()
-        self._arch_executors.clear()
+        for kv in self._kv_caches.values():
+            kv.free_all()
+            for c in kv.k_caches + kv.v_caches:
+                del c
+            kv.k_caches.clear()
+            kv.v_caches.clear()
+        for pool in self._pools.values():
+            pool.free()
+        self._pools.clear()
         self._executors.clear()
-
-        # Free all KV caches
-        freed_caches = set()
-        for name, cache in self._fa_kv.items():
-            if id(cache) not in freed_caches:
-                cache.free_all()
-                # Free the actual tensors
-                for c in cache.k_caches + cache.v_caches:
-                    del c
-                cache.k_caches.clear()
-                cache.v_caches.clear()
-                freed_caches.add(id(cache))
-        self._fa_kv.clear()
-
-        for name, pool in self._kv_pools.items():
-            pool.free_all()
-        self._kv_pools.clear()
-
-        for name, pools in self._tp_kv_pools.items():
-            for p in pools:
-                p.free_all()
-        self._tp_kv_pools.clear()
-
-        # Evict all models from GPU
-        for name in list(self.wm.models.keys()):
-            if self.wm.is_loaded(name):
-                self.wm.evict_from_gpu(name)
+        self._kv_caches.clear()
 
         import gc
         gc.collect()
-        for gpu_id in self.engine_config.gpu_ids:
-            with torch.cuda.device(gpu_id):
+        for gid in self.engine_config.gpu_ids:
+            with torch.cuda.device(gid):
                 torch.cuda.empty_cache()
 
 
 @dataclass
 class SchedulerStats:
     batches: int = 0
-    switches: int = 0
-    evictions: int = 0
-    requeued: int = 0
-    sync_loads: int = 0
-    prefetch_triggers: int = 0
-    prefetch_hits: int = 0
     completed: int = 0
     tokens_generated: int = 0
+    sync_swaps: int = 0
+    swap_time_ms: float = 0.0
+    prefetch_triggers: int = 0
+    prefetch_hits: int = 0

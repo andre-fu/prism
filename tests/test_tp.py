@@ -7,9 +7,9 @@ from safetensors.torch import load_file
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from huggingface_hub import snapshot_download
 
-from .distributed import TPGroup, shard_all_weights
-from .kv_cache import PagedKVPool
-from .tp_executor import TPModelExecutor
+from engine.distributed import TPGroup, shard_all_weights
+from engine.kv_cache import PagedKVPool
+from engine.tp_executor import TPModelExecutor
 
 MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
 PROMPT = "The capital of France is"

@@ -3,10 +3,10 @@
 import time
 import torch
 
-from .config import ModelConfig, EngineConfig
-from .memory_pool import PinnedPool, MultiGPUPool
-from .weight_manager import WeightManager
-from .kv_cache import PagedKVPool
+from engine.config import ModelConfig, EngineConfig
+from engine.memory_pool import PinnedPool, MultiGPUPool
+from engine.weight_manager import WeightManager
+from engine.kv_cache import PagedKVPool
 from .model_executor import ModelExecutor
 
 GPU = 0

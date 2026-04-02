@@ -40,8 +40,8 @@ def benchmark_prism():
     from engine.memory_pool import PinnedPool, MultiGPUPool
     from engine.weight_manager import WeightManager
     from engine.weight_pool import StaticWeightPool
-    from engine.fa_kv_cache import FlashAttnKVCache
-    from engine.fa_executor_v3 import FlashAttnExecutorV3
+    from engine.kv_cache import FlashAttnKVCache
+    from engine.executor import FlashAttnExecutorV3
     from transformers import AutoConfig, AutoTokenizer
 
     results = {}
@@ -98,11 +98,11 @@ def benchmark_prism():
 
     # Batched (8 concurrent)
     from engine.request_manager import RequestManager, RequestState
-    from engine.scheduler_v2 import SchedulerV2
+    from engine.scheduler import Scheduler
     from engine.config import SchedulerConfig
 
     rm = RequestManager()
-    sched = SchedulerV2(engine_cfg, SchedulerConfig(max_consecutive_batches=128), wm, rm, gpu)
+    sched = Scheduler(engine_cfg, SchedulerConfig(max_consecutive_batches=128), wm, rm, gpu)
     for p in BATCH_PROMPTS:
         rm.add_request("bench", p, tokenizer.encode(p), max_new_tokens=50)
 

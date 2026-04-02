@@ -19,8 +19,8 @@ from .config import EngineConfig, SchedulerConfig
 from .memory_pool import MultiGPUPool
 from .weight_manager import WeightManager
 from .weight_pool import StaticWeightPool
-from .fa_kv_cache import FlashAttnKVCache
-from .fa_executor_v3 import FlashAttnExecutorV3
+from .kv_cache import FlashAttnKVCache
+from .executor import FlashAttnExecutorV3
 from .request_manager import RequestManager, Request, RequestState
 from .fused_kernels import fused_rms_norm
 

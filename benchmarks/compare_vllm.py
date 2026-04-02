@@ -15,14 +15,14 @@ import requests as http_requests
 import json
 import sys
 
-from ..config import ModelConfig, EngineConfig, SchedulerConfig
-from ..memory_pool import PinnedPool, MultiGPUPool
-from ..weight_manager import WeightManager
-from ..kv_cache import PagedKVPool
-from ..model_executor import ModelExecutor
-from ..request_manager import RequestManager, RequestState
-from ..prefetch import PrefetchController
-from ..scheduler import Scheduler
+from engineconfig import ModelConfig, EngineConfig, SchedulerConfig
+from enginememory_pool import PinnedPool, MultiGPUPool
+from engineweight_manager import WeightManager
+from enginekv_cache import PagedKVPool
+from enginemodel_executor import ModelExecutor
+from enginerequest_manager import RequestManager, RequestState
+from engineprefetch import PrefetchController
+from enginescheduler import Scheduler
 
 GPU = 0
 DEVICE = f"cuda:{GPU}"

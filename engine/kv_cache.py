@@ -1,22 +1,19 @@
-"""Paged KV cache backed by FlashInfer."""
+"""Paged KV cache for flash_attn.
+
+flash_attn_with_kvcache expects:
+  k_cache: [num_blocks, page_size, num_kv_heads, head_dim]
+  v_cache: [num_blocks, page_size, num_kv_heads, head_dim]
+  block_table: [batch_size, max_blocks_per_seq]  (int32)
+  cache_seqlens: [batch_size]  (int32)
+
+The function handles both KV append AND attention in one kernel call.
+"""
 
 import torch
-import flashinfer
 
 
-class PagedKVPool:
-    """Per-model paged KV cache pool.
-
-    Each model gets its own pool because different models have different
-    num_kv_heads and head_dim. The pool is a stack of per-layer page tensors.
-
-    Page layout (NHD): [max_pages, 2, page_size, num_kv_heads, head_dim]
-      - dim 0: page index
-      - dim 1: 0=K, 1=V
-      - dim 2: token slot within page
-      - dim 3: KV head index
-      - dim 4: head dimension
-    """
+class FlashAttnKVCache:
+    """Paged KV cache backed by flash_attn's block table format."""
 
     def __init__(
         self,
@@ -36,29 +33,32 @@ class PagedKVPool:
         self.device = device
         self.dtype = dtype
 
-        # Per-layer page pool
-        self.pools = [
-            torch.zeros(max_pages, 2, page_size, num_kv_heads, head_dim,
+        # Per-layer K and V caches: [max_pages, page_size, num_kv_heads, head_dim]
+        self.k_caches = [
+            torch.zeros(max_pages, page_size, num_kv_heads, head_dim,
+                        dtype=dtype, device=device)
+            for _ in range(num_layers)
+        ]
+        self.v_caches = [
+            torch.zeros(max_pages, page_size, num_kv_heads, head_dim,
                         dtype=dtype, device=device)
             for _ in range(num_layers)
         ]
 
-        # Free page list (LIFO for cache locality)
+        # Free page list
         self.free_pages = list(range(max_pages - 1, -1, -1))
 
-        # Per-sequence state
+        # Per-sequence tracking
         self.seq_pages: dict[int, list[int]] = {}
         self.seq_len: dict[int, int] = {}
+        self.seq_owner: dict[int, str] = {}  # seq_id -> model_name
 
-        # FlashInfer workspaces (allocated once, reused)
-        self.prefill_workspace = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-        self.decode_workspace = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-        self.prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            self.prefill_workspace, kv_layout="NHD"
+        # Pre-allocated block table buffer (resized as needed)
+        self._max_blocks_per_seq = 32
+        self._block_table_buf = torch.zeros(
+            1, self._max_blocks_per_seq, dtype=torch.int32, device=device
         )
-        self.decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-            self.decode_workspace, kv_layout="NHD", use_tensor_cores=True
-        )
+        self._seqlens_buf = torch.zeros(1, dtype=torch.int32, device=device)
 
     @property
     def pages_used(self) -> int:
@@ -68,135 +68,142 @@ class PagedKVPool:
     def pages_free(self) -> int:
         return len(self.free_pages)
 
-    def new_sequence(self, seq_id: int):
-        """Start tracking a new sequence."""
-        page = self.free_pages.pop()
-        self.seq_pages[seq_id] = [page]
-        self.seq_len[seq_id] = 0
+    def new_sequence(self, seq_id: int, owner: str = "", prefix_pages: list[int] | None = None,
+                     prefix_len: int = 0):
+        """Start a new sequence, optionally with pre-cached prefix pages.
+
+        prefix_pages: page IDs from prefix cache (already contain KV data)
+        prefix_len: number of tokens already cached in those pages
+        """
+        if prefix_pages:
+            self.seq_pages[seq_id] = list(prefix_pages) + [self.free_pages.pop()]
+            self.seq_len[seq_id] = prefix_len
+        else:
+            page = self.free_pages.pop()
+            self.seq_pages[seq_id] = [page]
+            self.seq_len[seq_id] = 0
+        self.seq_owner[seq_id] = owner
 
     def free_sequence(self, seq_id: int):
-        """Free all pages for a sequence."""
         if seq_id in self.seq_pages:
             self.free_pages.extend(self.seq_pages.pop(seq_id))
             del self.seq_len[seq_id]
+            self.seq_owner.pop(seq_id, None)
+
+    def free_model_sequences(self, model_name: str):
+        """Free all sequences belonging to a specific model."""
+        to_free = [sid for sid, owner in self.seq_owner.items() if owner == model_name]
+        for sid in to_free:
+            self.free_sequence(sid)
 
     def free_all(self):
-        """Free all sequences and reset the pool."""
         self.free_pages = list(range(self.max_pages - 1, -1, -1))
         self.seq_pages.clear()
         self.seq_len.clear()
+        self.seq_owner.clear()
 
-    def has_capacity(self, num_pages: int = 1) -> bool:
-        """Check if there are enough free pages."""
-        return len(self.free_pages) >= num_pages
+    def sequences_for_model(self, model_name: str) -> list[int]:
+        """Get all sequence IDs owned by a model."""
+        return [sid for sid, owner in self.seq_owner.items() if owner == model_name]
 
-    def prepare_append(self, seq_id: int, num_tokens: int) -> int:
-        """Ensure capacity for new tokens and update seq_len.
+    def memory_used_by_model(self, model_name: str) -> int:
+        """Pages used by a model's sequences."""
+        return sum(len(self.seq_pages.get(sid, [])) for sid in self.sequences_for_model(model_name))
 
-        Returns the old sequence length (start position for the new tokens).
-        Must be called once before appending KV for all layers.
-        Raises RuntimeError if out of pages.
-        """
-        old_len = self.seq_len[seq_id]
-        needed_after = old_len + num_tokens
-        pages_needed = (needed_after + self.page_size - 1) // self.page_size
+    def get_seq_len(self, seq_id: int) -> int:
+        return self.seq_len.get(seq_id, 0)
+
+    def _ensure_capacity(self, seq_id: int, new_total: int):
+        pages_needed = (new_total + self.page_size - 1) // self.page_size
         while len(self.seq_pages[seq_id]) < pages_needed:
             if not self.free_pages:
-                raise RuntimeError(
-                    f"Out of KV cache pages: {self.max_pages} total, "
-                    f"{len(self.seq_pages)} active sequences. "
-                    f"Free some sequences or increase kv_cache_budget_gb."
-                )
+                raise RuntimeError(f"Out of KV cache pages ({self.max_pages} total)")
             self.seq_pages[seq_id].append(self.free_pages.pop())
-        self.seq_len[seq_id] = needed_after
-        return old_len
 
-    def build_page_table(self, seq_ids: list[int]):
-        """Build FlashInfer CSR-format page table for a batch of sequences.
+    def build_block_table(self, seq_ids: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build flash_attn block_table and cache_seqlens for a batch.
 
-        Returns (kv_indptr, kv_indices, kv_last_page_len) tensors.
+        Returns:
+            block_table: [batch_size, max_blocks] int32
+            cache_seqlens: [batch_size] int32
         """
-        indptr = [0]
-        indices = []
-        last_page_lens = []
-        for sid in seq_ids:
-            slen = self.seq_len[sid]
+        batch_size = len(seq_ids)
+        max_blocks = max(len(self.seq_pages.get(sid, [1])) for sid in seq_ids)
+        max_blocks = max(max_blocks, 1)
+
+        # Resize buffers if needed
+        if batch_size > self._block_table_buf.shape[0] or max_blocks > self._block_table_buf.shape[1]:
+            self._block_table_buf = torch.zeros(
+                max(batch_size, self._block_table_buf.shape[0]),
+                max(max_blocks, self._block_table_buf.shape[1]),
+                dtype=torch.int32, device=self.device,
+            )
+        if batch_size > self._seqlens_buf.shape[0]:
+            self._seqlens_buf = torch.zeros(batch_size, dtype=torch.int32, device=self.device)
+
+        bt = self._block_table_buf[:batch_size, :max_blocks]
+        sl = self._seqlens_buf[:batch_size]
+
+        for i, sid in enumerate(seq_ids):
             pages = self.seq_pages[sid]
-            if slen == 0:
-                indptr.append(indptr[-1])
-                last_page_lens.append(0)
-                continue
-            num_pages = (slen + self.page_size - 1) // self.page_size
-            indices.extend(pages[:num_pages])
-            indptr.append(len(indices))
-            last = slen % self.page_size
-            last_page_lens.append(last if last > 0 else self.page_size)
+            for j, page_id in enumerate(pages):
+                bt[i, j] = page_id
+            sl[i] = self.seq_len[sid]
 
-        return (
-            torch.tensor(indptr, dtype=torch.int32, device=self.device),
-            torch.tensor(indices, dtype=torch.int32, device=self.device),
-            torch.tensor(last_page_lens, dtype=torch.int32, device=self.device),
-        )
+        return bt, sl
 
-    def append_kv(
-        self,
-        layer_idx: int,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        kv_indptr: torch.Tensor,
-        kv_indices: torch.Tensor,
-        kv_last_page_len: torch.Tensor,
-        batch_indices: torch.Tensor,
-        positions: torch.Tensor,
-    ):
-        """Append K, V to the paged cache for one layer using FlashInfer kernel.
+    def update_seqlens(self, seq_ids: list[int], num_new_tokens: int | list[int]):
+        """Update sequence lengths after flash_attn_with_kvcache writes KV.
 
-        k, v: [nnz, num_kv_heads, head_dim]
+        flash_attn handles the actual cache write internally — we just track lengths.
         """
-        flashinfer.append_paged_kv_cache(
-            k, v, batch_indices, positions,
-            self.pools[layer_idx],
-            kv_indices, kv_indptr, kv_last_page_len,
-            kv_layout="NHD",
-        )
+        if isinstance(num_new_tokens, int):
+            for sid in seq_ids:
+                new_total = self.seq_len[sid] + num_new_tokens
+                self._ensure_capacity(sid, new_total)
+                self.seq_len[sid] = new_total
+        else:
+            for sid, n in zip(seq_ids, num_new_tokens):
+                new_total = self.seq_len[sid] + n
+                self._ensure_capacity(sid, new_total)
+                self.seq_len[sid] = new_total
 
-    def plan_prefill(
-        self,
-        qo_indptr: torch.Tensor,
-        kv_indptr: torch.Tensor,
-        kv_indices: torch.Tensor,
-        kv_last_page_len: torch.Tensor,
-        num_qo_heads: int,
-    ):
-        """Plan a prefill attention operation (call once, reuse across layers)."""
-        dtype_str = "bfloat16" if self.dtype == torch.bfloat16 else "float16"
-        self.prefill_wrapper.plan(
-            qo_indptr, kv_indptr, kv_indices, kv_last_page_len,
-            num_qo_heads, self.num_kv_heads, self.head_dim, self.page_size,
-            causal=True, pos_encoding_mode="NONE",
-            q_data_type=dtype_str, kv_data_type=dtype_str,
-        )
+    def has_capacity(self, num_pages: int = 1) -> bool:
+        return len(self.free_pages) >= num_pages
 
-    def run_prefill(self, layer_idx: int, q: torch.Tensor) -> torch.Tensor:
-        """Run prefill attention for one layer. q: [nnz, num_qo_heads, head_dim]."""
-        return self.prefill_wrapper.run(q, self.pools[layer_idx])
+    def transfer_sequence(self, seq_id: int, target_kv: "FlashAttnKVCache",
+                          target_seq_id: int | None = None) -> int:
+        """Copy a sequence's KV data to another KV cache (potentially on a different GPU).
 
-    def plan_decode(
-        self,
-        kv_indptr: torch.Tensor,
-        kv_indices: torch.Tensor,
-        kv_last_page_len: torch.Tensor,
-        num_qo_heads: int,
-    ):
-        """Plan a decode attention operation (call once, reuse across layers)."""
-        dtype_str = "bfloat16" if self.dtype == torch.bfloat16 else "float16"
-        self.decode_wrapper.plan(
-            kv_indptr, kv_indices, kv_last_page_len,
-            num_qo_heads, self.num_kv_heads, self.head_dim, self.page_size,
-            pos_encoding_mode="NONE",
-            q_data_type=dtype_str, kv_data_type=dtype_str,
-        )
+        Used for disaggregated prefill/decode: prefill GPU → decode GPU.
+        Returns the number of pages transferred.
+        """
+        if seq_id not in self.seq_pages:
+            return 0
 
-    def run_decode(self, layer_idx: int, q: torch.Tensor) -> torch.Tensor:
-        """Run decode attention for one layer. q: [batch_size, num_qo_heads, head_dim]."""
-        return self.decode_wrapper.run(q, self.pools[layer_idx])
+        dst_seq_id = target_seq_id if target_seq_id is not None else seq_id
+        src_pages = self.seq_pages[seq_id]
+        src_len = self.seq_len[seq_id]
+        num_pages_used = (src_len + self.page_size - 1) // self.page_size
+
+        # Allocate pages on target
+        target_kv.new_sequence(dst_seq_id)
+        target_kv._ensure_capacity(dst_seq_id, src_len)
+        dst_pages = target_kv.seq_pages[dst_seq_id]
+        target_kv.seq_len[dst_seq_id] = src_len
+
+        # Copy KV data page-by-page, layer-by-layer
+        for layer_idx in range(self.num_layers):
+            for i in range(num_pages_used):
+                src_pid = src_pages[i]
+                dst_pid = dst_pages[i]
+                # K cache
+                target_kv.k_caches[layer_idx][dst_pid].copy_(
+                    self.k_caches[layer_idx][src_pid], non_blocking=True
+                )
+                # V cache
+                target_kv.v_caches[layer_idx][dst_pid].copy_(
+                    self.v_caches[layer_idx][src_pid], non_blocking=True
+                )
+
+        return num_pages_used

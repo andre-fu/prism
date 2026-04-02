@@ -150,8 +150,8 @@ def benchmark_prism_latency():
     from engine.memory_pool import PinnedPool, MultiGPUPool
     from engine.weight_manager import WeightManager
     from engine.weight_pool import StaticWeightPool
-    from engine.fa_kv_cache import FlashAttnKVCache
-    from engine.fa_executor_v3 import FlashAttnExecutorV3
+    from engine.kv_cache import FlashAttnKVCache
+    from engine.executor import FlashAttnExecutorV3
     from transformers import AutoConfig, AutoTokenizer
 
     MODEL_ID = "Qwen/Qwen3-8B"

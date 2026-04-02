@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from flash_attn import flash_attn_with_kvcache
 
-from .fa_kv_cache import FlashAttnKVCache
+from .kv_cache import FlashAttnKVCache
 from .weight_pool import StaticWeightPool
 from .fused_kernels import fused_rms_norm
 

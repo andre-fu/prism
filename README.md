@@ -219,38 +219,38 @@ curl http://localhost:8000/v1/tenants/acme-corp/usage
 ## Project Structure
 
 ```
-engine/
-├── config.py              # YAML config dataclasses
-├── memory_pool.py         # GPU + pinned RAM memory management
-├── weight_manager.py      # Model loading, residency tracking
+engine/                    # Core inference engine
+├── executor.py            # CUDA graph decode + flash_attn (the fast path)
+├── scheduler.py           # Multi-model scheduler (spatial mux + async prefetch)
 ├── weight_pool.py         # Static GPU weight buffers (zero-alloc swap)
-├── fa_kv_cache.py         # Paged KV cache (flash_attn format)
-├── fa_executor_v3.py      # Production executor (CUDA graphs + flash_attn)
-├── model_executor.py      # Legacy executor (FlashInfer)
-├── tp_executor.py         # Tensor parallel executor
-├── distributed.py         # TP sharding + NCCL all-reduce
-├── speculative_executor.py # Speculative decoding (draft + target)
-├── disaggregated.py       # Disaggregated prefill/decode scheduler
+├── kv_cache.py            # Paged KV cache (flash_attn block tables)
+├── weight_manager.py      # Model loading, pinned RAM, residency tracking
+├── memory_pool.py         # GPU + pinned RAM memory pools
 ├── fused_kernels.py       # Triton fused RMSNorm
-├── prefix_cache.py        # Prefix caching (shared KV pages)
-├── model_registry.py      # Lazy loading + LRU eviction
-├── request_manager.py     # Per-model request queues
-├── scheduler_v2.py        # Production scheduler (spatial mux + async prefetch)
-├── prefetch.py            # Async weight prefetch controller
-├── server.py              # FastAPI HTTP server
-├── tenant_manager.py      # Multi-tenant auth + rate limiting
+├── config.py              # YAML config dataclasses
+├── server.py              # FastAPI HTTP server (OpenAI-compatible)
 ├── serve.py               # CLI entry point
-└── bench/                 # Benchmark suite
-    ├── compare_vllm.py    # Head-to-head vs vLLM
-    ├── prod_v2.py         # Production scenarios
-    └── realistic_swap.py  # 7B↔14B swap benchmarks
+├── request_manager.py     # Per-model request queues
+├── prefetch.py            # Async weight prefetch on copy stream
+├── tenant_manager.py      # Multi-tenant auth + rate limiting + metering
+├── persistence.py         # SQLite backend (tenants, keys, usage survive restart)
+├── model_registry.py      # Lazy loading from disk + LRU eviction
+├── model_upload.py        # Model upload validation + storage
+├── prefix_cache.py        # Shared KV pages for common prefixes
+├── speculative_executor.py # Draft + target speculative decoding
+├── disaggregated.py       # Separate prefill/decode GPU pools
+├── distributed.py         # TP sharding + NCCL all-reduce
+├── tp_executor.py         # Tensor parallel executor
+├── vlm_executor.py        # Vision-language model support
+├── lifecycle.py           # Graceful shutdown + drain
+├── metrics.py             # Histograms, counters, Prometheus export
+└── logging.py             # Structured JSON logging
 
-gpu_swap/                  # Legacy vLLM sleep/wake system
-├── orchestrator.py        # CLI for vLLM process management
-├── vllm_manager.py        # vLLM instance lifecycle
-├── nccl_orchestrator.py   # NCCL teardown/rebuild
-├── fast_swap.py           # Pinned async + page table swap experiments
-└── benchmark.py           # Swap latency benchmarks
+tests/                     # Pytest test suite (37 tests)
+benchmarks/                # Performance benchmarks vs vLLM, Modal, RunPod
+docs/                      # Architecture docs + benchmark graphics
+deploy/                    # nginx TLS config
+gpu_swap/                  # Legacy vLLM sleep/wake experiments
 ```
 
 ## License

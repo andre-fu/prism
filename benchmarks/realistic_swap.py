@@ -11,11 +11,11 @@ import time
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
-from ..config import ModelConfig, EngineConfig, SchedulerConfig
-from ..memory_pool import PinnedPool, MultiGPUPool
-from ..weight_manager import WeightManager
-from ..request_manager import RequestManager, RequestState
-from ..scheduler_v2 import SchedulerV2
+from engineconfig import ModelConfig, EngineConfig, SchedulerConfig
+from enginememory_pool import PinnedPool, MultiGPUPool
+from engineweight_manager import WeightManager
+from enginerequest_manager import RequestManager, RequestState
+from enginescheduler import Scheduler
 
 GPU = 0  # for memory reporting
 
@@ -116,7 +116,7 @@ def main():
     print(f"  Medical prompt: {len(medical_tokens)} tokens")
     print(f"  Code prompt: {len(code_tokens)} tokens")
 
-    scheduler = SchedulerV2(engine_cfg, sched_cfg, wm, rm, gpu)
+    scheduler = Scheduler(engine_cfg, sched_cfg, wm, rm, gpu)
 
     # ================================================================
     # Test 1: Cold start with long prompt (7B)
