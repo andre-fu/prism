@@ -1,3 +1,4 @@
+# TODO: Migrate to use engine.executor + engine.scheduler (v2 stack)
 """Test tensor parallelism: shard 7B across 4 GPUs, verify correct output."""
 
 import time
@@ -8,7 +9,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from huggingface_hub import snapshot_download
 
 from engine.distributed import TPGroup, shard_all_weights
-from engine.kv_cache import PagedKVPool
+from engine.kv_cache import FlashAttnKVCache as PagedKVPool
 from engine.tp_executor import TPModelExecutor
 
 MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"

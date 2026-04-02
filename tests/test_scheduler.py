@@ -1,3 +1,4 @@
+# TODO: Migrate to use engine.executor + engine.scheduler (v2 stack)
 """Integration test: multi-model automatic scheduling.
 
 Loads 2 models (7B and 0.5B to keep it fast), sends interleaved requests,

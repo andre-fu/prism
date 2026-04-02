@@ -1,3 +1,4 @@
+# TODO: Migrate to use engine.executor + engine.scheduler (v2 stack)
 """Test: load two models, swap between them, verify correct output."""
 
 import time
@@ -6,7 +7,7 @@ import torch
 from engine.config import ModelConfig, EngineConfig
 from engine.memory_pool import PinnedPool, MultiGPUPool
 from engine.weight_manager import WeightManager
-from engine.kv_cache import PagedKVPool
+from engine.kv_cache import FlashAttnKVCache as PagedKVPool
 from .model_executor import ModelExecutor
 
 GPU = 0

@@ -1,3 +1,4 @@
+# TODO: Migrate to use engine.executor + engine.scheduler (v2 stack)
 """Test: oversubscribed GPU — models don't all fit, scheduler must swap.
 
 Loads 7B (15GB) + 14B (30GB) = 45GB into 40GB weight budget.

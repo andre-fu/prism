@@ -318,12 +318,12 @@ async def metrics():
 
     # Scheduler metrics
     lines.append(f'engine_batches_total {s.batches}')
-    lines.append(f'engine_evictions_total {s.evictions}')
-    lines.append(f'engine_sync_loads_total {s.sync_loads}')
-    lines.append(f'engine_prefetch_triggers_total {s.prefetch_triggers}')
-    lines.append(f'engine_prefetch_hits_total {s.prefetch_hits}')
     lines.append(f'engine_completed_total {s.completed}')
     lines.append(f'engine_tokens_generated_total {s.tokens_generated}')
+    lines.append(f'engine_sync_swaps_total {s.sync_swaps}')
+    lines.append(f'engine_swap_time_ms {s.swap_time_ms:.1f}')
+    lines.append(f'engine_prefetch_triggers_total {s.prefetch_triggers}')
+    lines.append(f'engine_prefetch_hits_total {s.prefetch_hits}')
     lines.append(f'engine_pending_requests {_request_manager.total_pending()}')
 
     # Per-model metrics

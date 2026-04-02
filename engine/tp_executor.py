@@ -2,9 +2,15 @@
 
 import torch
 import flashinfer
-from .kv_cache import PagedKVPool
+from .kv_cache import FlashAttnKVCache as PagedKVPool
 from .distributed import TPGroup, get_shard_plan, ShardPlan
-from .model_executor import _rotate_half, _apply_rotary_emb
+from .executor import _rotate_half
+
+
+def _apply_rotary_emb(q, k, cos, sin):
+    cos = cos.unsqueeze(2)
+    sin = sin.unsqueeze(2)
+    return (q * cos) + (_rotate_half(q) * sin), (k * cos) + (_rotate_half(k) * sin)
 
 
 class TPModelExecutor:

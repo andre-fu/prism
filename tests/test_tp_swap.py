@@ -1,3 +1,4 @@
+# TODO: Migrate to use engine.executor + engine.scheduler (v2 stack)
 """Test: oversubscribed TP=4 swap.
 
 Loads 7B (TP=4) and 14B (TP=4) with a tight per-GPU budget.
@@ -12,7 +13,7 @@ from transformers import AutoConfig, AutoTokenizer
 from huggingface_hub import snapshot_download
 
 from engine.distributed import TPGroup, shard_all_weights
-from engine.kv_cache import PagedKVPool
+from engine.kv_cache import FlashAttnKVCache as PagedKVPool
 from engine.tp_executor import TPModelExecutor
 from tests.test_tp import create_model_on_device
 
